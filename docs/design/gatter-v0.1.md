@@ -336,12 +336,58 @@ for now and plans them through ESS's spec mutator.
 
 Section 5.
 
-### 6.6 llm-gateway, metaharness: the first consumer circuit
+### 6.6 llm-gateway, metaharness: harness nodes, LLM nodes, the first consumer circuit
 
-The LLM path that started this design (pass-through route, route choice, translate or relay) is the first
-composite to write: request fields in, a route enum and a relay mode out, oracles for upstream
-answers. The gateway crate stays dependency-free (`llm-gateway/docs/gateway.md:11-19`); a policy
-evaluated by Gatter would enter through the gateway's narrow ports (`CallerReview`,
+The owner, 2026-11-26: a real harness wrapped by metaharness becomes "harness_x" behind one
+interface, "unified metaharness ctrl + eventing <----> metaharness(claudecode|codex|... + config
+w/ baseURL etc) -> (anthropic/… OR llm-gateway) | then llm-gateway with routes either passthrough
+for the subscription stuff or vanilla API when api key … <-- this would be a "harness_node" - there
+could also be "just" an llm-node but this would not work with subs in the sense that it itself
+mimics and pretends to be claude-code".
+
+Two node kinds follow. Both are oracles (section 4) to the kernel: Gatter never runs them; a host
+does.
+
+**`harness_node`**: a real agent harness driven through metaharness.
+
+- Control and events: metaharness starts the harness behind one event stream and one command set
+  (approve, deny, inject, halt) (`metaharness/README.md:3-16`). Claude Code and Codex are adapters
+  today (`metaharness/crates/metaharness-protocol/src/spec.rs:19-31`).
+- Config: the run declares the model endpoint. For Claude Code that is `ANTHROPIC_BASE_URL`, for
+  Codex a `model_providers` entry with `base_url` (`metaharness/crates/metaharness-claude/src/launch.rs:1546-1558`;
+  `metaharness/crates/metaharness-codex/src/launch.rs:1422-1436`).
+- Upstream: the vendor directly, or llm-gateway.
+- At llm-gateway: a harness on its own subscription login uses a pass-through route
+  (`auth_kind = "client"`): the request and the client's own credential are forwarded unchanged,
+  and the gateway adds no credential (`llm-gateway/docs/gateway.md:600-618`). A harness on an API
+  key uses an ordinary route with the key held by the gateway or the client
+  (`llm-gateway/website/docs/guides/store-an-upstream-key.md`).
+- Ports: a task in; events and a result out. Outcome set: metaharness's `CloseReason`
+  (`completed`, `budget`, `killed`, `error`, `steer-halt`,
+  `metaharness/crates/metaharness-protocol/src/event.rs:944`). KPIs: tokens, cost, turns, wall time
+  (section 7.4).
+- Gap: metaharness's `--model-endpoint` requires `--credentials none` today
+  (`metaharness/crates/metaharness-protocol/src/spec.rs:335-341`), so "own subscription login +
+  gateway pass-through" needs a metaharness change.
+
+**`llm_node`**: one direct model call.
+
+- A single turn through llm's `Model::turn` port (`llm/crates/llm-core/src/port.rs:105-123`),
+  to a provider or through llm-gateway.
+- Credential: an API key, or none for a self-hosted model. **Never a subscription credential**: a
+  direct call carrying one would present itself as a vendor's own client. llm has an account kind
+  that does this (`subscription-oauth`, `llm/docs/messages.md:122-130`); an `llm_node` contract
+  refuses that account kind.
+- Ports: a request record (or `schema<…>`) in; an answer out. Outcome set: answer, tool call,
+  refusal, error. KPIs: tokens, cost, latency.
+
+The rule between them: subscription use only ever happens inside a `harness_node`, where the
+vendor's own client sends its own credential; everything else is an `llm_node` on an API key.
+
+**The first consumer circuit.** The route choice of that path (request fields in; a route enum,
+pass-through or translate, and the node kind out) is the first composite to write. The gateway
+crate stays dependency-free (`llm-gateway/docs/gateway.md:11-19`); a policy evaluated by Gatter
+would enter through the gateway's narrow ports (`CallerReview`,
 `llm-gateway/crates/llm-gateway/src/review.rs:118`) from its binary, never as a dependency of the
 gateway crate (inferred; not agreed with that repository).
 
@@ -397,6 +443,45 @@ gateway crate (inferred; not agreed with that repository).
 - The same mutation operators score a scenario set (killed / survived): one engine serves "find a
   better circuit" and "is this test suite strong".
 
+### 7.4 Quality composes
+
+The owner, 2026-11-26: "individual lower components start having kpis the more high level they
+become. and a composition of the units is also a composition of its quality? there will be an
+evaluatable quality for the composed system, genetic algorithms, variant generation".
+
+- **KPIs grow with level.** An atom has structural figures only: gate count, depth, state count,
+  latency in ticks. A composite adds the KPIs of its role: a router has accuracy against labelled
+  scenarios; an `llm_node` has tokens, cost and latency; a `harness_node` has turns, cost and wall
+  time; a behaviour tree has success rate and ticks to success.
+- **A KPI is declared** in a component's contract: a name, a unit, `better: lower | higher` (the
+  form ratchet uses, `ratchet/docs/design.md:28,144`), optional bounds as guarantees ("p95 latency
+  ≤ 5 ticks"), and how it composes.
+- **How a KPI composes** is declared per KPI kind, as in reliability block diagrams:
+  - additive in series, max in parallel: latency, ticks;
+  - additive everywhere: cost, tokens, gate count;
+  - multiplicative in series, `1 − Π(1 − r)` over a `fallback`: success probability, given
+    independent failures;
+  - expectation over a `mux`: any of the above, weighted by the branch distribution of the
+    selecting input (from an oracle's declared distribution, or measured);
+  - `measured`: no rule (accuracy, emergent behaviour of a feedback loop). The value comes only
+    from simulation or scenarios.
+- **Derived and measured are both kept.** A composite's KPI is derived from its children by the
+  rule, and measured by simulation (7.1). A gap between the two beyond a declared tolerance is a
+  finding: a hidden dependency between children, or a wrong independence assumption.
+- **The composed quality is the fitness.** A system's quality is a vector of its top-level KPIs;
+  the search (7.3) reads it with weights, and the gates (hard bounds) refuse a variant outright.
+  Every visited variant keeps the vector, so the result is a Pareto front, not one number.
+- **Genetic algorithms over sparse deltas.** A variant's genome is its delta (7.2): values at named
+  mutation points. Crossover takes the edits of two parents at disjoint mutation points; mutation
+  changes one point's value; a child that fails the check is stillborn. Because deltas are sparse
+  and sub-circuits shared by digest, a population of N variants costs the shared circuit plus the
+  N deltas (7.2).
+- **Learned nodes in the population** train through modelspec's population plan (5.6); their
+  KPIs (loss, accuracy, inference cost) enter the vector like any other.
+- **Cost of a KPI.** A derived KPI costs nothing to evaluate; a measured KPI costs a simulation, and
+  a KPI of a `harness_node` or `llm_node` costs real model calls when not sampled from a declared
+  distribution. The search prefers derived KPIs to prune, and measures only the front.
+
 ## 8. Shape of the code (planned)
 
 - `crates/gatter-core`: types, contracts, atoms, composites, check, `step`. IO-free, enforced by a
@@ -440,4 +525,7 @@ Decided 2026-11-26 by the owner: the name `gatter`, a public repository.
 5. Variants: mutation points, sparse deltas, `exhaustive` search, stillborn record.
 6. A `learned` node lowered to `.mspec`, trained by `modelspec train` from the CLI, lifted from its
    checkpoint; one scenario over the trained node.
-7. The LLM route-selection composite (6.6) as the first consumer circuit.
+7. The LLM route-selection composite (6.6) as the first consumer circuit, with `harness_node` and
+   `llm_node` as opaque kinds.
+8. KPI declarations and composition rules (7.4); derived and measured values side by side on one
+   composite; a genetic search over sparse deltas.
