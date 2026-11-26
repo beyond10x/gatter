@@ -1,0 +1,28 @@
+version: '3'
+
+set: [errexit, nounset, pipefail]
+
+tasks:
+  default:
+    cmds: [{task: check}]
+
+  check:
+    desc: Checks of a design-only repository
+    cmds:
+      - task: files
+      - task: no-python
+
+  files:
+    desc: The required files exist and CLAUDE.md points to AGENTS.md
+    cmds:
+      - |
+        for f in README.md AGENTS.md CLAUDE.md docs/design/gatter-v0.1.md; do
+          test -s "$f" || { echo "missing: $f"; exit 1; }
+        done
+      - grep -q 'AGENTS.md' CLAUDE.md
+
+  no-python:
+    desc: No Python file is committed
+    cmds:
+      - |
+        test -z "$(git ls-files '*.py')" || { git ls-files '*.py'; exit 1; }
